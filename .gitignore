@@ -1,0 +1,9 @@
+/build/
+/.idea/
+/.vscode/
+*.o
+*.a
+*.so
+*.swp
+*.log
+*.bin

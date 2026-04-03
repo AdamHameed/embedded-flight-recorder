@@ -8,10 +8,29 @@
 
 namespace {
 
+flight_recorder::RuntimeFaultMode parse_fault_mode(const std::string& value) {
+    if (value == "none") {
+        return flight_recorder::RuntimeFaultMode::None;
+    }
+    if (value == "crash-after-journal") {
+        return flight_recorder::RuntimeFaultMode::CrashAfterJournalSync;
+    }
+    if (value == "crash-during-write") {
+        return flight_recorder::RuntimeFaultMode::CrashDuringMainLogWrite;
+    }
+    if (value == "drop-commit") {
+        return flight_recorder::RuntimeFaultMode::DropCommit;
+    }
+    throw std::invalid_argument("unknown fault mode");
+}
+
 void print_usage() {
     std::cout
         << "Usage: flight_recorder [--output path] [--duration-seconds N] "
-        << "[--sample-rate-hz N] [--buffer-size N]\n";
+        << "[--sample-rate-hz N] [--buffer-size N] "
+        << "[--seed N] "
+        << "[--fault none|crash-after-journal|crash-during-write|drop-commit] "
+        << "[--fault-sequence N]\n";
 }
 
 }  // namespace
@@ -30,6 +49,12 @@ int main(int argc, char** argv) {
             config.sample_rate_hz = static_cast<unsigned int>(std::stoul(argv[++i]));
         } else if (arg == "--buffer-size" && i + 1 < argc) {
             config.buffer_size = static_cast<std::size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--seed" && i + 1 < argc) {
+            config.simulator_seed = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--fault" && i + 1 < argc) {
+            config.fault_config.mode = parse_fault_mode(argv[++i]);
+        } else if (arg == "--fault-sequence" && i + 1 < argc) {
+            config.fault_config.trigger_sequence = static_cast<std::uint64_t>(std::stoull(argv[++i]));
         } else if (arg == "--help") {
             print_usage();
             return 0;
@@ -67,7 +92,9 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Recording to " << config.output_path << " for "
-              << duration_seconds << " seconds\n";
+              << duration_seconds << " seconds"
+              << " seed=" << config.simulator_seed
+              << '\n';
     std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
     recorder.stop();
 

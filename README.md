@@ -6,10 +6,12 @@
 
 - C++17 + CMake project with `include/`, `src/`, `tools/`, and `tests/`
 - Simulated aircraft sensor stream with evolving values and status flags
+- Deterministic phase-driven flight simulation with reproducible seeds
 - Fixed-size in-memory circular buffer guarded by mutex/condition variable
 - Packed binary file header plus fixed-size records with magic, version, sequence, timestamp, payload, and CRC32
 - Sidecar write-ahead journal for crash-safe appends
 - Explicit flush, `fdatasync()`, and startup recovery flow for crash resilience
+- Fault injection hooks for crash, truncation, byte corruption, and interrupted commit
 - Replay and recovery CLI utilities
 
 ## Directory Layout
@@ -22,6 +24,7 @@ embedded-flight-recorder/
 │   ├── binary_log_writer.hpp
 │   ├── circular_buffer.hpp
 │   ├── crc32.hpp
+│   ├── fault_injection.hpp
 │   ├── flight_record.hpp
 │   ├── flight_recorder.hpp
 │   ├── recorder_config.hpp
@@ -29,6 +32,7 @@ embedded-flight-recorder/
 │   └── sensor_simulator.hpp
 ├── src/
 │   ├── binary_log_writer.cpp
+│   ├── fault_injection.cpp
 │   ├── flight_recorder.cpp
 │   ├── main.cpp
 │   ├── recovery_manager.cpp
@@ -36,6 +40,7 @@ embedded-flight-recorder/
 ├── tests/
 │   └── flight_recorder_tests.cpp
 └── tools/
+    ├── fault_injector.cpp
     ├── recovery_tool.cpp
     └── replay_tool.cpp
 ```
@@ -43,10 +48,27 @@ embedded-flight-recorder/
 ## Architecture
 
 ### `SensorSimulator`
-Generates plausible aircraft telemetry at a configurable sample rate. The simulator intentionally evolves values gradually rather than emitting random noise so replay output looks like a believable flight segment.
+Generates plausible aircraft telemetry at a configurable sample rate using a deterministic phase-driven profile instead of raw random numbers. The simulator progresses through:
+
+- startup
+- takeoff
+- climb
+- cruise
+- descent
+- landing
+
+Within each phase, altitude, airspeed, heading, vertical speed, engine temperature, and RPM evolve smoothly toward target envelopes. This makes replay output look like a believable sortie rather than a synthetic sine wave.
+
+The simulator also injects occasional deterministic anomalies from the configured seed:
+
+- short engine temperature spike during high-power flight
+- brief abrupt altitude drop event
+- short-lived sensor glitch with pitot disagreement flag
+
+Those events are rare enough to keep the trace plausible, but visible enough to make replay and debugging demos interesting.
 
 ### `FlightRecord`
-Represents one telemetry sample in memory. It contains the fields the recorder pipeline cares about: time, altitude, airspeed, heading, vertical speed, engine temperature, engine RPM, and a bitmask of status flags.
+Represents one telemetry sample in memory. It contains the fields the recorder pipeline cares about: time, altitude, airspeed, heading, vertical speed, engine temperature, engine RPM, and a bitmask of status flags. The status bitfield is used to surface warnings such as engine temperature exceedance, pitot disagreement, recorder overruns, altitude deviation, sensor glitches, and phase transitions.
 
 ### `CircularBuffer`
 A bounded producer/consumer queue. In an embedded design this acts like a small RAM-backed staging area between time-sensitive data acquisition and slower persistent storage. When full, the implementation drops the oldest sample and tracks that event so the system fails in a bounded, observable way instead of allocating unbounded memory.
@@ -143,6 +165,7 @@ The journal protects against:
 - power loss between journal write and main-log write
 - power loss after main-log flush but before journal clear
 - torn or partial main-log record writes, which are still detected by the main-log CRC and valid-prefix scan
+- software-injected dropped commits and simulated crash windows used for demos and tests
 
 The current design does not protect against:
 
@@ -174,6 +197,7 @@ Startup recovery is intentionally conservative:
 - If power is lost after journaling intent but before the main log append is durable, startup recovery replays the journaled record into the main log.
 - If power is lost after the main log flush but before clearing the journal, startup recovery sees that the record already exists and clears the stale journal entry.
 - If a bit flip changes any header or payload byte, CRC32 validation fails and the record is rejected.
+- If a fault injector truncates the tail, recovery reports the first bad record boundary and can truncate back to the last valid prefix.
 - If a parser lands on garbage data, wrong file magic, wrong record magic, wrong version, or unexpected packed sizes cause an immediate rejection.
 - If a damaged log repeats or rewinds the sequence counter, recovery rejects the non-monotonic record stream.
 
@@ -182,15 +206,39 @@ Startup recovery is intentionally conservative:
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build
 ```
+
+## Tests
+
+Build and run the test suite:
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Run the test executable directly for named pass/fail output:
+
+```bash
+./build/flight_recorder_tests
+```
+
+The suite covers:
+
+- `CircularBuffer` push/pop and overflow behavior
+- packed record serialization/deserialization
+- CRC/checksum validation
+- replay parsing of valid logs
+- truncated and corrupted record detection
+- recovery after interrupted journaled writes
 
 ## Run
 
 Record a short session:
 
 ```bash
-./build/flight_recorder --output flight_log.bin --duration-seconds 5 --sample-rate-hz 20 --buffer-size 128
+./build/flight_recorder --output flight_log.bin --duration-seconds 5 --sample-rate-hz 20 --buffer-size 128 --seed 42
 ```
 
 At startup the recorder prints a recovery summary before it begins sampling, for example:
@@ -212,11 +260,63 @@ Validate and optionally truncate a corrupted tail:
 ./build/recovery_tool flight_log.bin --truncate
 ```
 
+## Fault Injection
+
+Normal run:
+
+```bash
+./build/flight_recorder --output demo.bin --duration-seconds 3
+```
+
+Crash after journaling intent:
+
+```bash
+./build/flight_recorder --output demo.bin --duration-seconds 5 --fault crash-after-journal --fault-sequence 3
+```
+
+Crash during the main-log write:
+
+```bash
+./build/flight_recorder --output demo.bin --duration-seconds 5 --fault crash-during-write --fault-sequence 3
+```
+
+Interrupted commit that leaves only the journaled intent:
+
+```bash
+./build/flight_recorder --output demo.bin --duration-seconds 5 --fault drop-commit --fault-sequence 3
+```
+
+Next boot recovery:
+
+```bash
+./build/flight_recorder --output demo.bin --duration-seconds 1
+```
+
+Offline tail truncation:
+
+```bash
+./build/fault_injector truncate demo.bin 16
+```
+
+Offline byte corruption in record sequence `4`:
+
+```bash
+./build/fault_injector corrupt demo.bin 4 12
+```
+
+Replay of the valid prefix with corruption reporting:
+
+```bash
+./build/replay_tool demo.bin
+```
+
 ## Design Notes
 
 - The on-disk structures are packed to keep the binary format stable and compact.
 - CRC32 is used as a lightweight integrity check that fits embedded-style log validation well.
 - The recorder separates acquisition from persistence so sensor timing is less impacted by storage latency.
+- The simulator uses a seeded deterministic profile so demo runs are repeatable during debugging or interviews.
+- Flight phases and anomaly injection are designed to be plausible enough for avionics-style log review without pretending to be a certified aircraft model.
 - Safe shutdown flushes remaining in-memory records before exit.
 - Recovery operates on a valid-prefix model because embedded recorders often favor salvageable data over perfect reconstruction.
 

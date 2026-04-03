@@ -42,6 +42,9 @@ int main(int argc, char** argv) {
               << " valid_records=" << report.valid_records
               << " valid_bytes=" << report.valid_bytes
               << " last_sequence=" << report.last_sequence
+              << " corruption_detected=" << (report.corruption_detected ? "true" : "false")
+              << " first_bad_record_index=" << report.first_bad_record_index
+              << " first_bad_record_sequence=" << report.first_bad_record_sequence
               << '\n';
     std::cout << report.message << '\n';
 

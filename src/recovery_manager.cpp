@@ -199,6 +199,8 @@ RecoveryReport scan_file(const std::string& path,
     while (true) {
         PersistedRecordHeader header {};
         const auto record_offset = valid_bytes;
+        report.first_bad_record_index = report.valid_records + 1;
+        report.corruption_offset = record_offset;
 
         if (!read_exact(input, &header, sizeof(header))) {
             if (input.eof() && input.gcount() == 0) {
@@ -206,16 +208,20 @@ RecoveryReport scan_file(const std::string& path,
                 report.valid_bytes = valid_bytes;
                 report.message = "Log validated successfully";
             } else {
+                report.corruption_detected = true;
                 report.valid_bytes = valid_bytes;
                 report.message = "Detected partial record header at end of file";
             }
             break;
         }
 
+        report.first_bad_record_sequence = header.sequence;
+
         if (header.magic != kLogRecordMagic ||
             header.version != kLogFormatVersion ||
             header.header_size != sizeof(PersistedRecordHeader) ||
             header.payload_size != sizeof(PersistedFlightPayload)) {
+            report.corruption_detected = true;
             report.valid_bytes = valid_bytes;
             report.message = "Detected invalid record metadata";
             break;
@@ -225,6 +231,7 @@ RecoveryReport scan_file(const std::string& path,
         std::uint32_t stored_crc = 0;
         if (!read_exact(input, &payload, sizeof(payload)) ||
             !read_exact(input, &stored_crc, sizeof(stored_crc))) {
+            report.corruption_detected = true;
             report.valid_bytes = valid_bytes;
             report.message = "Detected truncated record payload";
             break;
@@ -232,6 +239,7 @@ RecoveryReport scan_file(const std::string& path,
 
         const auto computed_crc = compute_record_crc(header, payload);
         if (stored_crc != computed_crc) {
+            report.corruption_detected = true;
             report.valid_bytes = valid_bytes;
             ++report.checksum_failures;
             report.message = "Detected CRC mismatch";
@@ -239,6 +247,7 @@ RecoveryReport scan_file(const std::string& path,
         }
 
         if (seen_record && header.sequence <= previous_sequence) {
+            report.corruption_detected = true;
             report.valid_bytes = valid_bytes;
             report.message = "Detected non-monotonic record sequence";
             break;
@@ -289,6 +298,14 @@ RecoveryReport RecoveryManager::validate(const std::string& path) const {
 
 RecoveryReport RecoveryManager::recover(const std::string& path, bool truncate_invalid_tail) const {
     return scan_healthy_prefix(path, truncate_invalid_tail);
+}
+
+bool RecoveryManager::scan_replayable_log(const std::string& path,
+                                          ReplayLog& replay_log,
+                                          RecoveryReport& report) const {
+    replay_log = ReplayLog {};
+    report = scan_file(path, &replay_log.metadata, &replay_log.entries, false);
+    return true;
 }
 
 StartupRecoveryReport RecoveryManager::recover_startup_state(const std::string& path) const {
@@ -361,8 +378,8 @@ StartupRecoveryReport RecoveryManager::recover_startup_state(const std::string& 
 }
 
 bool RecoveryManager::read_log(const std::string& path, ReplayLog& replay_log, std::string& error) const {
-    replay_log = ReplayLog {};
-    const RecoveryReport report = scan_file(path, &replay_log.metadata, &replay_log.entries, false);
+    RecoveryReport report;
+    scan_replayable_log(path, replay_log, report);
     if (!report.healthy) {
         error = report.message;
         replay_log = ReplayLog {};

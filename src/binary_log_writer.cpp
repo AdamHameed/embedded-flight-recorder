@@ -23,9 +23,10 @@ int durable_sync(int fd) {
 
 }  // namespace
 
-BinaryLogWriter::BinaryLogWriter(std::string path)
+BinaryLogWriter::BinaryLogWriter(std::string path, RuntimeFaultConfig fault_config)
     : path_(std::move(path)),
-      journal_path_(RecoveryManager::journal_path_for_log(path_)) {}
+      journal_path_(RecoveryManager::journal_path_for_log(path_)),
+      fault_config_(fault_config) {}
 
 BinaryLogWriter::~BinaryLogWriter() {
     close();
@@ -106,6 +107,33 @@ bool BinaryLogWriter::append(const FlightRecord& record, std::uint64_t sequence)
     if (!write_journal_intent(journal_entry)) {
         return false;
     }
+
+    const bool fault_armed =
+        !fault_injected_ &&
+        fault_config_.mode != RuntimeFaultMode::None &&
+        sequence == fault_config_.trigger_sequence;
+
+    if (fault_armed && fault_config_.mode == RuntimeFaultMode::CrashAfterJournalSync) {
+        fault_injected_ = true;
+        ::_exit(91);
+    }
+    if (fault_armed && fault_config_.mode == RuntimeFaultMode::DropCommit) {
+        fault_injected_ = true;
+        return false;
+    }
+
+    if (fault_armed && fault_config_.mode == RuntimeFaultMode::CrashDuringMainLogWrite) {
+        fault_injected_ = true;
+        if (!write_full(fd_, &header, sizeof(header))) {
+            return false;
+        }
+        const auto partial_payload_size = sizeof(payload) / 2u;
+        if (!write_full(fd_, &payload, partial_payload_size) || durable_sync(fd_) != 0) {
+            return false;
+        }
+        ::_exit(92);
+    }
+
     if (!write_full(fd_, &header, sizeof(header)) ||
         !write_full(fd_, &payload, sizeof(payload)) ||
         !write_full(fd_, &record_crc, sizeof(record_crc)) ||

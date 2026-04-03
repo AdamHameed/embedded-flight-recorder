@@ -9,7 +9,10 @@ enum SystemStatusFlag : std::uint32_t {
     StatusEngineWarning = 1u << 1,
     StatusLowOilPressure = 1u << 2,
     StatusPitotDisagree = 1u << 3,
-    StatusRecorderBufferOverrun = 1u << 4
+    StatusRecorderBufferOverrun = 1u << 4,
+    StatusSensorGlitch = 1u << 5,
+    StatusAltitudeDeviation = 1u << 6,
+    StatusFlightPhaseTransition = 1u << 7
 };
 
 struct FlightRecord {

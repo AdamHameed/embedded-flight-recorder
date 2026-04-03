@@ -22,6 +22,10 @@ struct RecoveryReport {
     std::uint64_t last_sequence {0};
     std::size_t valid_bytes {0};
     std::size_t checksum_failures {0};
+    bool corruption_detected {false};
+    std::size_t first_bad_record_index {0};
+    std::uint64_t first_bad_record_sequence {0};
+    std::size_t corruption_offset {0};
     std::string message;
 };
 
@@ -55,6 +59,7 @@ public:
     RecoveryReport validate(const std::string& path) const;
     RecoveryReport recover(const std::string& path, bool truncate_invalid_tail) const;
     StartupRecoveryReport recover_startup_state(const std::string& path) const;
+    bool scan_replayable_log(const std::string& path, ReplayLog& replay_log, RecoveryReport& report) const;
     bool read_log(const std::string& path, ReplayLog& replay_log, std::string& error) const;
     bool read_all(const std::string& path, std::vector<ReplayEntry>& out_records, std::string& error) const;
 };

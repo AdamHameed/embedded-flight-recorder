@@ -10,6 +10,7 @@ option(FLIGHT_RECORDER_BUILD_TESTS "Build unit tests" ON)
 
 add_library(flight_recorder_lib
     src/binary_log_writer.cpp
+    src/fault_injection.cpp
     src/flight_recorder.cpp
     src/recovery_manager.cpp
     src/sensor_simulator.cpp
@@ -38,6 +39,9 @@ target_link_libraries(replay_tool PRIVATE flight_recorder_lib)
 
 add_executable(recovery_tool tools/recovery_tool.cpp)
 target_link_libraries(recovery_tool PRIVATE flight_recorder_lib)
+
+add_executable(fault_injector tools/fault_injector.cpp)
+target_link_libraries(fault_injector PRIVATE flight_recorder_lib)
 
 if(FLIGHT_RECORDER_BUILD_TESTS)
     enable_testing()

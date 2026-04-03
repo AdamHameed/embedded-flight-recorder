@@ -8,7 +8,8 @@ namespace flight_recorder {
 FlightRecorder::FlightRecorder(RecorderConfig config)
     : config_(std::move(config)),
       buffer_(config_.buffer_size),
-      writer_(config_.output_path) {}
+      simulator_(config_.simulator_seed),
+      writer_(config_.output_path, config_.fault_config) {}
 
 FlightRecorder::~FlightRecorder() {
     stop();

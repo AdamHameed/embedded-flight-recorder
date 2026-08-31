@@ -7,13 +7,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <thread>
+#include <vector>
 
 namespace flight_recorder {
 
 struct RecorderStats {
     std::uint64_t total_records_generated {0};
     std::uint64_t total_records_written {0};
+    std::uint64_t total_records_committed {0};
     std::uint64_t dropped_records {0};
     std::uint64_t buffer_high_watermark {0};
     bool writer_error {false};
@@ -31,6 +34,7 @@ public:
     bool start();
     void stop();
     RecorderStats stats() const;
+    WriterStats writer_stats() const { return writer_.stats(); }
 
 private:
     void sensor_loop();
@@ -41,6 +45,8 @@ private:
     CircularBuffer buffer_;
     SensorSimulator simulator_;
     BinaryLogWriter writer_;
+    std::vector<SequencedRecord> writer_batch_;
+    std::unique_ptr<FlightRecord[]> drain_buffer_;
 
     std::atomic<bool> running_ {false};
     std::atomic<bool> stop_requested_ {false};
@@ -48,6 +54,7 @@ private:
     std::atomic<std::uint64_t> sequence_ {0};
     std::atomic<std::uint64_t> total_records_generated_ {0};
     std::atomic<std::uint64_t> total_records_written_ {0};
+    std::atomic<std::uint64_t> total_records_committed_ {0};
     std::atomic<std::uint64_t> dropped_records_ {0};
     std::atomic<std::uint64_t> buffer_high_watermark_ {0};
     std::atomic<bool> writer_error_ {false};

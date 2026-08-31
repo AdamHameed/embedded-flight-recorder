@@ -1,329 +1,224 @@
-# embedded-flight-recorder
+# Embedded Flight Recorder
 
-`embedded-flight-recorder` is a Linux-hosted C++17 simulation of an embedded flight data recorder pipeline. It is structured like a small systems project: sensor production runs on one thread, durable logging runs on another thread, records move through a bounded circular buffer, and offline tools support replay and recovery.
+A C++17 simulation of a crash-resilient telemetry recorder. A producer thread
+generates flight data, a consumer thread serializes fixed-size records, and a
+bounded single-producer/single-consumer (SPSC) ring separates acquisition from
+storage I/O.
 
-## Highlights
+The project focuses on four systems concerns:
 
-- C++17 + CMake project with `include/`, `src/`, `tools/`, and `tests/`
-- Simulated aircraft sensor stream with evolving values and status flags
-- Deterministic phase-driven flight simulation with reproducible seeds
-- Fixed-size in-memory circular buffer guarded by mutex/condition variable
-- Packed binary file header plus fixed-size records with magic, version, sequence, timestamp, payload, and CRC32
-- Sidecar write-ahead journal for crash-safe appends
-- Explicit flush, `fdatasync()`, and startup recovery flow for crash resilience
-- Fault injection hooks for crash, truncation, byte corruption, and interrupted commit
-- Replay and recovery CLI utilities
+- bounded memory and observable overload
+- corruption detection with CRC32 and contiguous sequence numbers
+- batched, explicit-offset file I/O
+- recovery to a durably acknowledged checkpoint after interruption
 
-## Directory Layout
-
-```text
-embedded-flight-recorder/
-├── CMakeLists.txt
-├── README.md
-├── include/flight_recorder/
-│   ├── binary_log_writer.hpp
-│   ├── circular_buffer.hpp
-│   ├── crc32.hpp
-│   ├── fault_injection.hpp
-│   ├── flight_record.hpp
-│   ├── flight_recorder.hpp
-│   ├── recorder_config.hpp
-│   ├── recovery_manager.hpp
-│   └── sensor_simulator.hpp
-├── src/
-│   ├── binary_log_writer.cpp
-│   ├── fault_injection.cpp
-│   ├── flight_recorder.cpp
-│   ├── main.cpp
-│   ├── recovery_manager.cpp
-│   └── sensor_simulator.cpp
-├── tests/
-│   └── flight_recorder_tests.cpp
-└── tools/
-    ├── fault_injector.cpp
-    ├── recovery_tool.cpp
-    └── replay_tool.cpp
-```
+It is a systems-programming project, not certified avionics software or a
+hard-real-time implementation.
 
 ## Architecture
 
-### `SensorSimulator`
-Generates plausible aircraft telemetry at a configurable sample rate using a deterministic phase-driven profile instead of raw random numbers. The simulator progresses through:
+```mermaid
+flowchart LR
+    S[Sensor simulator] --> P[Producer thread]
+    P --> Q[Bounded SPSC ring]
+    Q --> W[Writer thread]
+    W --> B[Aligned batch serialization]
+    B --> L[Binary log]
+    W --> J[Two-slot checkpoint journal]
+    L --> R[Replay and recovery]
+    J --> R
+```
 
-- startup
-- takeoff
-- climb
-- cruise
-- descent
-- landing
+The ring allocates its storage before worker threads start. The producer and
+consumer publish cursor changes with acquire/release atomics; condition
+variables park a thread only when the queue crosses an empty or full boundary.
+If the producer cannot enqueue within one sample period, the sample is dropped
+and the event is recorded.
 
-Within each phase, altitude, airspeed, heading, vertical speed, engine temperature, and RPM evolve smoothly toward target envelopes. This makes replay output look like a believable sortie rather than a synthetic sine wave.
+The writer drains multiple samples at once, serializes them into a reusable
+aligned buffer, and uses an explicit-offset `pwrite()` loop that handles
+`EINTR` and short writes. Linux builds can reserve file extents with
+`fallocate(FALLOC_FL_KEEP_SIZE)`.
 
-The simulator also injects occasional deterministic anomalies from the configured seed:
+## Durability model
 
-- short engine temperature spike during high-power flight
-- brief abrupt altitude drop event
-- short-lived sensor glitch with pitot disagreement flag
+Each commit group follows this order:
 
-Those events are rare enough to keep the trace plausible, but visible enough to make replay and debugging demos interesting.
+1. Write one or more complete record batches to the main log.
+2. Synchronize the main log.
+3. Write the next generation to the inactive checkpoint slot.
+4. Synchronize the journal.
+5. Report the group as committed.
 
-### `FlightRecord`
-Represents one telemetry sample in memory. It contains the fields the recorder pipeline cares about: time, altitude, airspeed, heading, vertical speed, engine temperature, engine RPM, and a bitmask of status flags. The status bitfield is used to surface warnings such as engine temperature exceedance, pitot disagreement, recorder overruns, altitude deviation, sensor glitches, and phase transitions.
+The sidecar journal contains two CRC-protected checkpoint slots. Recovery chooses
+the newest valid slot that agrees with the log's file identity, valid prefix,
+record count, and last sequence. A written but uncommitted tail may be removed;
+records reported as committed must remain in the selected prefix.
 
-### `CircularBuffer`
-A bounded producer/consumer queue. In an embedded design this acts like a small RAM-backed staging area between time-sensitive data acquisition and slower persistent storage. When full, the implementation drops the oldest sample and tracks that event so the system fails in a bounded, observable way instead of allocating unbounded memory.
+This model relies on the synchronization guarantees provided by the operating
+system and filesystem. It does not attempt to survive simultaneous corruption
+of both checkpoint slots, acknowledged log corruption, or storage-device loss.
 
-### `FlightRecorder`
-Owns the runtime pipeline: start/stop control, sensor thread, writer thread, buffer, backpressure handling, and graceful shutdown.
+## Binary format
 
-### `BinaryLogWriter`
-Serializes `FlightRecord` data to a packed binary format with a single file header followed by fixed-size append-only records. Each append is protected by a sidecar journal file (`<log>.journal`) so interrupted writes can be recovered on the next startup.
-
-## File Format
-
-### Endianness and Packing
-
-The current implementation assumes a little-endian Linux target and IEEE-754 `double`. It does not serialize the in-memory `FlightRecord` directly. Instead, it writes dedicated packed on-disk structs composed only of fixed-width integer types and explicitly ordered `double` fields:
-
-- compiler padding is disabled with `#pragma pack(push, 1)`
-- field sizes are guarded with `static_assert`
-- the code rejects big-endian builds at compile time
-
-This is a deliberate embedded-style tradeoff: the format is compact and fast on the intended target, while the assumptions are documented clearly instead of being left implicit.
-
-### File Header
-
-Written once at offset `0`:
+The file begins with a 24-byte header followed by fixed 84-byte records:
 
 ```text
-+----------------------+--------------------------------------+
-| Field                | Notes                                |
-+----------------------+--------------------------------------+
-| magic                | file magic (`FLOG`)                  |
-| version              | format version                       |
-| header_size          | packed file header size              |
-| recorder_start_time  | wall-clock start time in microseconds|
-| record_size          | fixed on-disk size of each record    |
-| header_crc32         | CRC32 over the file header           |
-+----------------------+--------------------------------------+
+file header
+  magic | version | header size | start time | record size | CRC32
+
+record
+  magic | version | header size | payload size
+  sequence | timestamp
+  altitude | airspeed | heading | vertical speed
+  engine temperature | engine RPM | status flags
+  CRC32
 ```
 
-### Record Layout
+Replay validates the file header, record metadata, CRC32, and exact sequence
+continuity in one forward scan. The current format requires a little-endian
+target with IEEE-754 `double`.
 
-Each appended record contains:
+## Build and test
+
+Requirements:
+
+- CMake 3.16 or newer
+- a C++17 compiler
+- a POSIX-like operating system
+
+```bash
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
+```
+
+Release and sanitizer presets are also available:
+
+```bash
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+
+cmake --preset ubsan
+cmake --build --preset ubsan
+ctest --preset ubsan
+```
+
+On Linux, the `linux-asan-ubsan` preset enables both AddressSanitizer and
+UndefinedBehaviorSanitizer.
+
+The test suite covers ring wraparound and concurrency, packed serialization,
+CRC and metadata corruption, truncated records, sequence gaps, short writes,
+group commit, checkpoint fallback, legacy-journal migration, and startup
+recovery.
+
+## Quick demo
+
+```bash
+scripts/run_demo.sh
+```
+
+The script builds the Release configuration, uses a temporary directory, records
+and replays a deterministic flight, injects a byte-level corruption, verifies
+that replay rejects it, and runs the process-interruption matrix. See
+[`docs/DEMO.md`](docs/DEMO.md) for the expected output.
+
+## Command-line tools
+
+Record a five-second session:
+
+```bash
+./build-debug/flight_recorder \
+  --output flight_log.bin \
+  --duration-seconds 5 \
+  --sample-rate-hz 20 \
+  --buffer-size 256 \
+  --batch-size 64 \
+  --sync-every-batches 1 \
+  --seed 42
+```
+
+Inspect or export the valid prefix:
+
+```bash
+./build-debug/replay_tool flight_log.bin --summary
+./build-debug/replay_tool flight_log.bin --csv flight_log.csv
+```
+
+Validate a log and optionally remove an invalid tail:
+
+```bash
+./build-debug/recovery_tool flight_log.bin
+./build-debug/recovery_tool flight_log.bin --truncate
+```
+
+Inject faults for manual testing:
+
+```bash
+./build-debug/fault_injector truncate flight_log.bin 16
+./build-debug/fault_injector corrupt flight_log.bin 4 12
+```
+
+Run 180 deterministic process-interruption cases:
+
+```bash
+./build-release/crash_matrix artifacts/crash-matrix/local-release.json
+```
+
+The matrix covers interruption before the main write, during a partial main
+write, after the main write but before synchronization, after main-log
+synchronization but before the checkpoint, during a partial checkpoint write,
+and after the journal has been synchronized. Each case performs recovery twice
+and verifies the resulting prefix, file size, sequence continuity, and
+idempotence.
+
+These are deterministic process-level fault tests. They are useful for checking
+commit-state transitions, but they are not a substitute for power-cut testing
+on real storage hardware.
+
+## Benchmarking
+
+`recorder_benchmark` exercises the complete unpaced path: production, ring
+transfer, serialization, real file writes, checkpoint commits, and replay
+validation. It reports:
+
+- generated, written, committed, and dropped counts
+- end-to-end records per second
+- one-second throughput windows
+- main-log write latency
+- main-log synchronization latency
+- operation counters and platform metadata
+
+Run the repeatable Linux benchmark suite with:
+
+```bash
+scripts/run_linux_benchmarks.sh artifacts/linux-benchmarks
+```
+
+Results are intentionally generated locally rather than checked into Git.
+Throughput and latency depend on the CPU, kernel, filesystem, storage device,
+configuration, and competing load. Metric definitions and the experimental
+method are documented in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+## Repository layout
 
 ```text
-+----------------+-------------------------------+
-| Field          | Notes                         |
-+----------------+-------------------------------+
-| magic          | 32-bit constant               |
-| version        | 16-bit format version         |
-| header_size    | 16-bit packed header bytes    |
-| payload_size   | 32-bit payload bytes          |
-| sequence       | 64-bit monotonic sample id    |
-| timestamp_us   | 64-bit sample timestamp       |
-| payload        | packed telemetry payload      |
-| crc32          | CRC over header+payload       |
-+----------------+-------------------------------+
+include/flight_recorder/  public types and recorder components
+src/                      recorder, writer, simulator, recovery
+tools/                    replay, recovery, fault, crash, benchmark utilities
+tests/                    deterministic test suite
+scripts/                  demo and Linux benchmark orchestration
+docs/                     format, benchmark, and demo documentation
 ```
 
-Because every record has the same packed size, replay and recovery can scan linearly without needing separators, indexes, or variable-length parsing.
+## Known limitations
 
-The writer uses low-level file descriptors, retries short writes, and calls `fdatasync()` after flushes. This is slower than a buffered desktop logger, but it models the durability choices often made in safety-oriented data capture systems.
-
-## Journal Format
-
-The journal is a single-entry write-ahead log stored beside the main file as `<log>.journal`. It contains:
-
-- journal magic and version
-- pending state
-- copied record header
-- copied record payload
-- copied record CRC32
-- journal CRC32 over the whole journal entry
-
-Only one in-flight append is journaled at a time. That keeps the implementation small and realistic for an embedded recorder with a single writer thread.
-
-### Append Sequence
-
-For each record:
-
-1. Write the pending journal entry and `fdatasync()` the journal.
-2. Append the record to the main log and `fdatasync()` the main file.
-3. Clear the journal and `fdatasync()` the clear.
-
-This means a crash can leave the system in one of two recoverable states:
-
-- the journal exists but the record never reached the main log: recovery rolls the record forward
-- the journal exists and the record already reached the main log: recovery clears the stale journal
-
-### Consistency Guarantees
-
-The journal protects against:
-
-- process crashes during an append
-- power loss between journal write and main-log write
-- power loss after main-log flush but before journal clear
-- torn or partial main-log record writes, which are still detected by the main-log CRC and valid-prefix scan
-- software-injected dropped commits and simulated crash windows used for demos and tests
-
-The current design does not protect against:
-
-- simultaneous corruption of both the main log and the journal
-- filesystem or hardware reordering beyond the durability guarantees of `fdatasync()`
-- directory entry loss if the filesystem does not durably persist newly created files without syncing the parent directory
-
-Those limitations are deliberate for a compact internship-scale project, and they are called out explicitly rather than hidden.
-
-### `RecoveryManager`
-Scans a log from the beginning, validates structure and CRC, inspects the sidecar journal, and detects:
-
-- trailing partial records
-- bad magic/version fields
-- payload size mismatches
-- CRC failures
-- pending or corrupt journal entries
-
-Startup recovery is intentionally conservative:
-
-- if the main log has a damaged tail, it truncates back to the last valid prefix
-- if the journal contains a valid pending record that is not yet in the log, it rolls that record forward
-- if the journal contains a stale committed record, it clears the journal
-- if the journal is corrupt, it discards the journal and preserves the validated main log
-
-### Corruption Detection Examples
-
-- If power is lost halfway through a record write, replay will hit EOF before a full record is present and report a truncated tail.
-- If power is lost after journaling intent but before the main log append is durable, startup recovery replays the journaled record into the main log.
-- If power is lost after the main log flush but before clearing the journal, startup recovery sees that the record already exists and clears the stale journal entry.
-- If a bit flip changes any header or payload byte, CRC32 validation fails and the record is rejected.
-- If a fault injector truncates the tail, recovery reports the first bad record boundary and can truncate back to the last valid prefix.
-- If a parser lands on garbage data, wrong file magic, wrong record magic, wrong version, or unexpected packed sizes cause an immediate rejection.
-- If a damaged log repeats or rewinds the sequence counter, recovery rejects the non-monotonic record stream.
-
-## Build
-
-```bash
-cmake -S . -B build
-cmake --build build
-```
-
-## Tests
-
-Build and run the test suite:
-
-```bash
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-Run the test executable directly for named pass/fail output:
-
-```bash
-./build/flight_recorder_tests
-```
-
-The suite covers:
-
-- `CircularBuffer` push/pop and overflow behavior
-- packed record serialization/deserialization
-- CRC/checksum validation
-- replay parsing of valid logs
-- truncated and corrupted record detection
-- recovery after interrupted journaled writes
-
-## Run
-
-Record a short session:
-
-```bash
-./build/flight_recorder --output flight_log.bin --duration-seconds 5 --sample-rate-hz 20 --buffer-size 128 --seed 42
-```
-
-At startup the recorder prints a recovery summary before it begins sampling, for example:
-
-```text
-startup_recovery healthy=true log_truncated=false journal_found=true journal_replayed=true journal_cleared=true last_sequence=1042
-rolled pending journal entry forward and cleared journal
-```
-
-Replay the captured data:
-
-```bash
-./build/replay_tool flight_log.bin
-```
-
-Validate and optionally truncate a corrupted tail:
-
-```bash
-./build/recovery_tool flight_log.bin --truncate
-```
-
-## Fault Injection
-
-Normal run:
-
-```bash
-./build/flight_recorder --output demo.bin --duration-seconds 3
-```
-
-Crash after journaling intent:
-
-```bash
-./build/flight_recorder --output demo.bin --duration-seconds 5 --fault crash-after-journal --fault-sequence 3
-```
-
-Crash during the main-log write:
-
-```bash
-./build/flight_recorder --output demo.bin --duration-seconds 5 --fault crash-during-write --fault-sequence 3
-```
-
-Interrupted commit that leaves only the journaled intent:
-
-```bash
-./build/flight_recorder --output demo.bin --duration-seconds 5 --fault drop-commit --fault-sequence 3
-```
-
-Next boot recovery:
-
-```bash
-./build/flight_recorder --output demo.bin --duration-seconds 1
-```
-
-Offline tail truncation:
-
-```bash
-./build/fault_injector truncate demo.bin 16
-```
-
-Offline byte corruption in record sequence `4`:
-
-```bash
-./build/fault_injector corrupt demo.bin 4 12
-```
-
-Replay of the valid prefix with corruption reporting:
-
-```bash
-./build/replay_tool demo.bin
-```
-
-## Design Notes
-
-- The on-disk structures are packed to keep the binary format stable and compact.
-- CRC32 is used as a lightweight integrity check that fits embedded-style log validation well.
-- The recorder separates acquisition from persistence so sensor timing is less impacted by storage latency.
-- The simulator uses a seeded deterministic profile so demo runs are repeatable during debugging or interviews.
-- Flight phases and anomaly injection are designed to be plausible enough for avionics-style log review without pretending to be a certified aircraft model.
-- Safe shutdown flushes remaining in-memory records before exit.
-- Recovery operates on a valid-prefix model because embedded recorders often favor salvageable data over perfect reconstruction.
-
-## Future Improvements
-
-- Dual-file journal or segment rotation for stronger crash consistency guarantees
-- Record batching with configurable sync intervals
-- Endianness tagging and cross-platform decoding helpers
-- More detailed fault injection tests for torn writes and disk-full conditions
-- Additional aircraft phases and fault scenarios in the simulator
+- The format is little-endian and does not yet support cross-endian decoding.
+- There is no segment rotation or retention policy.
+- The recorder does not provide hard-real-time scheduling guarantees.
+- Fault injection models process interruption and partial writes, not a physical
+  loss of power or storage media.
+- CRC32 detects accidental corruption but is not cryptographic authentication.
+- Linux preallocation behavior and performance must be measured on the target
+  filesystem.

@@ -2,19 +2,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 
 namespace flight_recorder {
 
-inline std::uint32_t update_crc32(std::uint32_t crc, const std::uint8_t* data, std::size_t length) {
-    for (std::size_t i = 0; i < length; ++i) {
-        crc ^= static_cast<std::uint32_t>(data[i]);
-        for (int bit = 0; bit < 8; ++bit) {
-            const bool lsb_set = (crc & 1u) != 0u;
-            crc >>= 1u;
-            if (lsb_set) {
-                crc ^= 0xEDB88320u;
+inline const std::array<std::uint32_t, 256>& crc32_table() {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> values {};
+        for (std::uint32_t index = 0; index < values.size(); ++index) {
+            std::uint32_t value = index;
+            for (int bit = 0; bit < 8; ++bit) {
+                value = (value >> 1u) ^ ((value & 1u) != 0u ? 0xEDB88320u : 0u);
             }
+            values[index] = value;
         }
+        return values;
+    }();
+    return table;
+}
+
+inline std::uint32_t update_crc32(std::uint32_t crc, const std::uint8_t* data, std::size_t length) {
+    const auto& table = crc32_table();
+    for (std::size_t i = 0; i < length; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8u);
     }
     return crc;
 }

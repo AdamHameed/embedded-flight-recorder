@@ -1,9 +1,22 @@
 /build/
+/build-*/
 /.idea/
 /.vscode/
+.DS_Store
 *.o
 *.a
 *.so
 *.swp
 *.log
 *.bin
+*.journal
+*.ack
+*.csv
+/compile_commands.json
+
+# Benchmark results and crash-matrix workspaces are generated locally.
+/artifacts/benchmarks/*.json
+/artifacts/benchmarks/*.warmup
+/artifacts/crash-matrix/*-work-*/
+/artifacts/crash-matrix/*.json
+/artifacts/linux-benchmarks/

@@ -1,3 +1,0 @@
-sequence,timestamp_us,altitude_m,airspeed_kts,heading_deg,vertical_speed_fpm,engine_temperature_c,engine_rpm,system_status
-2,1775192358515553,1202.54,136.767,73.4072,268.524,632.583,2190.18,1
-3,1775192358715554,1203.89,137.148,74.1144,282.273,633.858,2195.22,1

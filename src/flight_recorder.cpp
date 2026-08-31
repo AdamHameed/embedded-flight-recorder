@@ -9,7 +9,14 @@ FlightRecorder::FlightRecorder(RecorderConfig config)
     : config_(std::move(config)),
       buffer_(config_.buffer_size),
       simulator_(config_.simulator_seed),
-      writer_(config_.output_path, config_.fault_config) {}
+      writer_(config_.output_path,
+              config_.fault_config,
+              WriterOptions {config_.batch_size, config_.sync_every_batches,
+                             config_.preallocation_chunk_bytes,
+                             config_.serialization_buffer_alignment}),
+      drain_buffer_(config_.batch_size == 0 ? nullptr : std::make_unique<FlightRecord[]>(config_.batch_size)) {
+    writer_batch_.reserve(config_.batch_size);
+}
 
 FlightRecorder::~FlightRecorder() {
     stop();
@@ -20,6 +27,11 @@ void FlightRecorder::set_start_sequence(std::uint64_t sequence) {
 }
 
 bool FlightRecorder::start() {
+    if (config_.buffer_size == 0 || config_.sample_rate_hz == 0 || config_.batch_size == 0 ||
+        config_.sync_every_batches == 0 || config_.output_path.empty()) {
+        return false;
+    }
+
     if (running_.exchange(true)) {
         return false;
     }
@@ -30,6 +42,7 @@ bool FlightRecorder::start() {
     sequence_.store(start_sequence_);
     total_records_generated_.store(0);
     total_records_written_.store(0);
+    total_records_committed_.store(0);
     dropped_records_.store(0);
     buffer_high_watermark_.store(0);
     buffer_.reset();
@@ -38,6 +51,7 @@ bool FlightRecorder::start() {
         running_.store(false);
         return false;
     }
+    writer_.reset_measurement_counters();
 
     sensor_thread_ = std::thread(&FlightRecorder::sensor_loop, this);
     writer_thread_ = std::thread(&FlightRecorder::writer_loop, this);
@@ -66,7 +80,8 @@ void FlightRecorder::stop() {
 }
 
 void FlightRecorder::sensor_loop() {
-    const auto sample_period = std::chrono::microseconds(1'000'000u / config_.sample_rate_hz);
+    const auto sample_period = std::chrono::microseconds(
+        std::max<std::uint64_t>(1, 1'000'000u / config_.sample_rate_hz));
     auto next_sample_deadline = std::chrono::steady_clock::now();
 
     while (!stop_requested_.load()) {
@@ -90,7 +105,9 @@ void FlightRecorder::sensor_loop() {
             break;
         }
 
-        std::this_thread::sleep_until(next_sample_deadline);
+        if (!config_.unpaced_producer) {
+            std::this_thread::sleep_until(next_sample_deadline);
+        }
     }
 }
 
@@ -105,8 +122,15 @@ void FlightRecorder::writer_loop() {
             break;
         }
 
-        const auto sequence = sequence_.fetch_add(1) + 1;
-        if (!writer_.append(record, sequence)) {
+        writer_batch_.clear();
+        writer_batch_.push_back(SequencedRecord {record, sequence_.fetch_add(1) + 1});
+        const auto drained = buffer_.try_pop_batch(drain_buffer_.get(), config_.batch_size - 1);
+        for (std::size_t index = 0; index < drained; ++index) {
+            writer_batch_.push_back(
+                SequencedRecord {drain_buffer_[index], sequence_.fetch_add(1) + 1});
+        }
+
+        if (!writer_.append_batch(writer_batch_)) {
             // Stop acquisition if persistence fails so we do not pretend data is durable.
             stop_requested_.store(true);
             writer_error_.store(true);
@@ -114,11 +138,14 @@ void FlightRecorder::writer_loop() {
             break;
         }
 
-        total_records_written_.fetch_add(1);
-        writer_.flush();
+        total_records_written_.fetch_add(writer_batch_.size());
+        total_records_committed_.store(writer_.stats().records_committed);
     }
 
-    writer_.flush();
+    if (!writer_.flush()) {
+        writer_error_.store(true);
+    }
+    total_records_committed_.store(writer_.stats().records_committed);
 }
 
 RecorderStats FlightRecorder::stats() const {
@@ -126,6 +153,7 @@ RecorderStats FlightRecorder::stats() const {
     RecorderStats snapshot;
     snapshot.total_records_generated = total_records_generated_.load();
     snapshot.total_records_written = total_records_written_.load();
+    snapshot.total_records_committed = total_records_committed_.load();
     snapshot.dropped_records = dropped_records_.load();
     snapshot.buffer_high_watermark =
         std::max<std::uint64_t>(buffer_high_watermark_.load(), buffer_stats.high_watermark);

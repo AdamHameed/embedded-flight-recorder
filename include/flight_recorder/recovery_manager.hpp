@@ -21,10 +21,12 @@ struct RecoveryReport {
     std::size_t valid_records {0};
     std::uint64_t last_sequence {0};
     std::size_t valid_bytes {0};
+    std::size_t bytes_scanned {0};
     std::size_t checksum_failures {0};
     bool corruption_detected {false};
     std::size_t first_bad_record_index {0};
     std::uint64_t first_bad_record_sequence {0};
+    std::uint64_t expected_sequence {0};
     std::size_t corruption_offset {0};
     std::string message;
 };
@@ -36,8 +38,11 @@ struct StartupRecoveryReport {
     bool journal_cleared {false};
     bool journal_replayed {false};
     bool journal_discarded {false};
+    bool journal_migrated {false};
     std::size_t valid_records {0};
     std::uint64_t last_sequence {0};
+    std::uint64_t checkpoint_generation {0};
+    std::uint64_t committed_length {0};
     std::size_t checksum_failures {0};
     std::string message;
 };

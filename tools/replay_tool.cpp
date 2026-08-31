@@ -230,6 +230,9 @@ void print_invalid_boundary(const flight_recorder::RecoveryReport& report) {
               << " first_bad_record_index=" << report.first_bad_record_index
               << " first_bad_record_sequence=" << report.first_bad_record_sequence
               << " corruption_offset=" << report.corruption_offset
+              << " valid_bytes=" << report.valid_bytes
+              << " bytes_scanned=" << report.bytes_scanned
+              << " expected_sequence=" << report.expected_sequence
               << " reason=\"" << report.message << "\"\n";
 }
 

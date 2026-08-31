@@ -60,18 +60,35 @@ struct PersistedJournalEntry {
     std::uint32_t record_crc32;
     std::uint32_t journal_crc32;
 };
+
+struct PersistedCheckpointSlot {
+    std::uint32_t magic;
+    std::uint16_t version;
+    std::uint16_t slot_size;
+    std::uint64_t generation;
+    std::uint64_t recorder_start_time_us;
+    std::uint64_t committed_length;
+    std::uint64_t record_count;
+    std::uint64_t last_sequence;
+    std::uint32_t checkpoint_crc32;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(PersistedFileHeader) == 24u, "Unexpected file header size");
 static_assert(sizeof(PersistedFlightPayload) == 52u, "Unexpected payload packing");
 static_assert(sizeof(PersistedRecordHeader) == 28u, "Unexpected record header size");
 static_assert(sizeof(PersistedJournalEntry) == 112u, "Unexpected journal entry size");
+static_assert(sizeof(PersistedCheckpointSlot) == 52u, "Unexpected checkpoint slot size");
 
 constexpr std::uint32_t kLogFileMagic = 0x464C4F47u;     // "FLOG"
 constexpr std::uint32_t kLogRecordMagic = 0x46524344u;   // "FRCD"
 constexpr std::uint32_t kJournalMagic = 0x464A4E4Cu;     // "FJNL"
 constexpr std::uint16_t kLogFormatVersion = 1u;
 constexpr std::uint32_t kJournalStatePending = 1u;
+constexpr std::uint16_t kCheckpointJournalVersion = 2u;
+constexpr std::size_t kCheckpointSlotCount = 2u;
+constexpr std::size_t kCheckpointJournalSize =
+    kCheckpointSlotCount * sizeof(PersistedCheckpointSlot);
 
 constexpr std::size_t kPersistedRecordSize =
     sizeof(PersistedRecordHeader) + sizeof(PersistedFlightPayload) + sizeof(std::uint32_t);
@@ -117,6 +134,20 @@ inline std::uint32_t compute_journal_crc(const PersistedJournalEntry& entry) {
     PersistedJournalEntry crc_input = entry;
     crc_input.journal_crc32 = 0;
     return compute_crc32(&crc_input, sizeof(crc_input));
+}
+
+inline std::uint32_t compute_checkpoint_crc(const PersistedCheckpointSlot& slot) {
+    PersistedCheckpointSlot crc_input = slot;
+    crc_input.checkpoint_crc32 = 0;
+    return compute_crc32(&crc_input, sizeof(crc_input));
+}
+
+inline bool checkpoint_metadata_valid(const PersistedCheckpointSlot& slot) {
+    return slot.magic == kJournalMagic &&
+           slot.version == kCheckpointJournalVersion &&
+           slot.slot_size == sizeof(PersistedCheckpointSlot) &&
+           slot.generation != 0 &&
+           compute_checkpoint_crc(slot) == slot.checkpoint_crc32;
 }
 
 }  // namespace flight_recorder

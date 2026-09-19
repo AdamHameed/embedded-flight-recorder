@@ -112,9 +112,30 @@ void FlightRecorder::sensor_loop() {
 }
 
 void FlightRecorder::writer_loop() {
+    using Clock = std::chrono::steady_clock;
+    const auto flush_interval = std::chrono::milliseconds(config_.flush_interval_ms);
+    bool pending_commit = false;
+    auto commit_deadline = Clock::time_point::max();
     while (true) {
+        if (pending_commit && Clock::now() >= commit_deadline) {
+            if (!writer_.flush()) {
+                stop_requested_.store(true);
+                writer_error_.store(true);
+                buffer_.close();
+                break;
+            }
+            total_records_committed_.store(writer_.stats().records_committed);
+            pending_commit = false;
+        }
+
+        auto wait_time = std::chrono::duration_cast<Clock::duration>(
+            std::chrono::milliseconds(250));
+        if (pending_commit) {
+            wait_time = std::max(Clock::duration::zero(),
+                                std::min(wait_time, commit_deadline - Clock::now()));
+        }
         FlightRecord record;
-        const auto pop_status = buffer_.pop_wait_for(record, std::chrono::milliseconds(250));
+        const auto pop_status = buffer_.pop_wait_for(record, wait_time);
         if (pop_status == CircularBuffer::PopStatus::Timeout) {
             continue;
         }
@@ -130,6 +151,7 @@ void FlightRecorder::writer_loop() {
                 SequencedRecord {drain_buffer_[index], sequence_.fetch_add(1) + 1});
         }
 
+        const auto batch_started = Clock::now();
         if (!writer_.append_batch(writer_batch_)) {
             // Stop acquisition if persistence fails so we do not pretend data is durable.
             stop_requested_.store(true);
@@ -140,6 +162,13 @@ void FlightRecorder::writer_loop() {
 
         total_records_written_.fetch_add(writer_batch_.size());
         total_records_committed_.store(writer_.stats().records_committed);
+        if (writer_.stats().records_written == writer_.stats().records_committed) {
+            pending_commit = false;
+        } else if (config_.flush_interval_ms != 0 && !pending_commit) {
+            // Further batches must not postpone the oldest uncommitted data.
+            commit_deadline = batch_started + flush_interval;
+            pending_commit = true;
+        }
     }
 
     if (!writer_.flush()) {

@@ -2,6 +2,7 @@
 #include "flight_recorder/recovery_manager.hpp"
 
 #include <chrono>
+#include <charconv>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -53,7 +54,7 @@ void print_usage() {
     std::cout
         << "Usage: flight_recorder [--output path] [--duration-seconds N] "
         << "[--sample-rate-hz N] [--buffer-size N] "
-        << "[--batch-size N] [--sync-every-batches N] "
+        << "[--batch-size N] [--sync-every-batches N] [--flush-interval-ms N] "
         << "[--seed N] "
         << "[--unpaced] "
         << "[--fault none|crash-before-write|crash-during-write|crash-after-write|"
@@ -61,6 +62,7 @@ void print_usage() {
            "crash-during-checkpoint|crash-after-checkpoint|crash-before-journal-sync|"
            "crash-after-journal|drop-commit] "
         << "[--fault-sequence N]\n"
+        << "Flush interval: milliseconds before committing a pending group; 0 disables the timer.\n"
         << "Counters: generated=sensor samples; written=complete main-log records; "
            "committed=records covered by a durably acknowledged checkpoint; "
            "dropped=records evicted from the full bounded ring.\n";
@@ -87,6 +89,13 @@ int main(int argc, char** argv) {
                 config.batch_size = static_cast<std::size_t>(std::stoull(argv[++i]));
             } else if (arg == "--sync-every-batches" && i + 1 < argc) {
                 config.sync_every_batches = static_cast<std::size_t>(std::stoull(argv[++i]));
+            } else if (arg == "--flush-interval-ms" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                const auto result = std::from_chars(
+                    value.data(), value.data() + value.size(), config.flush_interval_ms);
+                if (result.ec != std::errc {} || result.ptr != value.data() + value.size()) {
+                    throw std::invalid_argument("flush interval must be an unsigned 32-bit integer");
+                }
             } else if (arg == "--seed" && i + 1 < argc) {
                 config.simulator_seed = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             } else if (arg == "--unpaced") {

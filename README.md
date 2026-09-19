@@ -50,6 +50,19 @@ Each commit group follows this order:
 4. Synchronize the journal.
 5. Report the group as committed.
 
+By default, `--sync-every-batches` controls when groups are committed.
+Set `--flush-interval-ms 100` to also commit pending data after 100 ms,
+even when no new samples arrive. The timer starts with the first pending batch;
+additional batches do not extend it. Whichever trigger fires first commits the
+group. The default interval is `0` (disabled), and shutdown always flushes.
+The interval is a scheduling target: an ongoing write, synchronization, or OS
+scheduling delay can make a commit take longer.
+
+```bash
+./build-debug/flight_recorder --output grouped.bin --sample-rate-hz 20 \
+  --sync-every-batches 64 --flush-interval-ms 100 --duration-seconds 5
+```
+
 The sidecar journal contains two CRC-protected checkpoint slots. Recovery chooses
 the newest valid slot that agrees with the log's file identity, valid prefix,
 record count, and last sequence. A written but uncommitted tail may be removed;

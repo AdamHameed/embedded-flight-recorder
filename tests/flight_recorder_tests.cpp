@@ -429,6 +429,95 @@ void test_recorder_clean_shutdown() {
     remove_if_present(flight_recorder::RecoveryManager::journal_path_for_log(path));
 }
 
+void test_timed_group_commit() {
+    // At one sample per second the writer is idle between records. A very
+    // large batch threshold ensures only the timer can commit while running.
+    const std::string path = "test_timed_commit.bin";
+    cleanup_log(path);
+    flight_recorder::RecorderConfig config;
+    config.output_path = path;
+    config.sample_rate_hz = 1;
+    config.sync_every_batches = 1'000'000;
+    config.flush_interval_ms = 30;
+    flight_recorder::FlightRecorder recorder(config);
+    EXPECT_TRUE(recorder.start());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+    while (recorder.stats().total_records_committed == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const auto live = recorder.stats();
+    // Inspect the checkpoint before stop() can flush it. This verifies that the
+    // live counter corresponds to an actual CRC-valid checkpoint on disk.
+    std::array<flight_recorder::PersistedCheckpointSlot,
+               flight_recorder::kCheckpointSlotCount> slots {};
+    std::ifstream journal(path + ".journal", std::ios::binary);
+    journal.read(reinterpret_cast<char*>(slots.data()), sizeof(slots));
+    bool checkpoint_found = false;
+    for (const auto& slot : slots) {
+        checkpoint_found = checkpoint_found ||
+            (flight_recorder::checkpoint_metadata_valid(slot) &&
+             slot.record_count > 0 && slot.record_count >= live.total_records_committed);
+    }
+    recorder.stop();
+    EXPECT_TRUE(live.total_records_committed > 0);
+    EXPECT_TRUE(checkpoint_found);
+    EXPECT_TRUE(live.total_records_written < config.sync_every_batches);
+    EXPECT_TRUE(!live.writer_error);
+    const auto recovered = flight_recorder::RecoveryManager {}.recover_startup_state(path);
+    EXPECT_TRUE(recovered.healthy);
+    EXPECT_EQ(recovered.valid_records, recorder.stats().total_records_committed);
+    cleanup_log(path);
+}
+
+void test_group_commit_timer_disabled() {
+    const std::string path = "test_commit_timer_disabled.bin";
+    cleanup_log(path);
+    flight_recorder::RecorderConfig config;
+    config.output_path = path;
+    config.sample_rate_hz = 1000;
+    config.sync_every_batches = 1'000'000;
+    EXPECT_EQ(config.flush_interval_ms, 0u);
+    flight_recorder::FlightRecorder recorder(config);
+    EXPECT_TRUE(recorder.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto live = recorder.stats();
+    recorder.stop();
+    EXPECT_TRUE(live.total_records_written > 0);
+    EXPECT_EQ(live.total_records_committed, 0u);
+    EXPECT_EQ(recorder.stats().total_records_committed, recorder.stats().total_records_written);
+    EXPECT_TRUE(!recorder.stats().writer_error);
+    cleanup_log(path);
+}
+
+void test_group_commit_timer_under_load() {
+    const std::string path = "test_commit_timer_load.bin";
+    cleanup_log(path);
+    flight_recorder::RecorderConfig config;
+    config.output_path = path;
+    config.sample_rate_hz = 1000;
+    config.sync_every_batches = 1'000'000;
+    config.flush_interval_ms = 30;
+    flight_recorder::FlightRecorder recorder(config);
+    EXPECT_TRUE(recorder.start());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    std::uint64_t first_commit = 0;
+    std::uint64_t later_commit = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        later_commit = recorder.stats().total_records_committed;
+        if (first_commit == 0) first_commit = later_commit;
+        if (later_commit > first_commit && first_commit > 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    recorder.stop();
+    EXPECT_TRUE(first_commit > 0);
+    EXPECT_TRUE(later_commit > first_commit);
+    EXPECT_TRUE(recorder.stats().total_records_written < config.sync_every_batches);
+    EXPECT_EQ(recorder.stats().total_records_written, recorder.stats().total_records_committed);
+    EXPECT_TRUE(!recorder.stats().writer_error);
+    cleanup_log(path);
+}
+
 void test_record_serialization_deserialization() {
     const auto original = make_record(42, 3200.25);
     const auto payload = flight_recorder::make_persisted_payload(original);
@@ -1089,6 +1178,9 @@ int main() {
         {"Recorder rejects zero capacity", test_recorder_rejects_zero_capacity},
         {"Recorder rejects invalid configuration", test_recorder_rejects_invalid_configuration},
         {"Recorder clean shutdown", test_recorder_clean_shutdown},
+        {"Timed group commit while idle", test_timed_group_commit},
+        {"Disabled timer preserves batch-only commits", test_group_commit_timer_disabled},
+        {"Timed group commit under continuing load", test_group_commit_timer_under_load},
         {"Record serialization/deserialization", test_record_serialization_deserialization},
         {"Checksum validation", test_checksum_validation},
         {"Replay parsing of valid files", test_replay_parses_valid_file},

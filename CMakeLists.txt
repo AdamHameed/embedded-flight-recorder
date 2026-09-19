@@ -90,4 +90,14 @@ if(FLIGHT_RECORDER_BUILD_TESTS)
     target_link_libraries(flight_recorder_tests PRIVATE flight_recorder_lib)
 
     add_test(NAME flight_recorder_tests COMMAND flight_recorder_tests)
+    if(UNIX)
+        find_program(BASH_EXECUTABLE bash)
+        if(NOT BASH_EXECUTABLE)
+            message(FATAL_ERROR "CLI session tests require bash")
+        endif()
+        add_test(NAME cli_session_tests
+            COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_session_tests.sh
+                    $<TARGET_FILE:flight_recorder> $<TARGET_FILE:replay_tool>)
+        set_tests_properties(cli_session_tests PROPERTIES TIMEOUT 30)
+    endif()
 endif()

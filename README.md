@@ -152,6 +152,26 @@ Record a five-second session:
   --seed 42
 ```
 
+Record continuously with live counters once per second:
+
+```bash
+./build-debug/flight_recorder --output flight_log.bin \
+  --run-until-signal --stats-interval-ms 1000 --flush-interval-ms 100
+```
+
+Ctrl-C (`SIGINT`) or `SIGTERM` stops acquisition, drains queued records, commits
+the pending group, and validates the log. Successful graceful shutdown returns
+0; a writer or validation failure returns 2. Signals also stop timed sessions
+early. Shutdown waits for acquisition and disk I/O; it is not a hard deadline.
+`SIGKILL` and power loss still require checkpoint recovery on the next start.
+
+`--run-until-signal` cannot be combined with `--duration-seconds`. The default
+remains five seconds, and a zero duration still ends immediately. Live status
+is disabled by default (`--stats-interval-ms 0`); its counters are independently
+sampled, not a transactionally consistent snapshot. Final counters are reported
+after shutdown. Writer failures end a continuous session automatically. Logs
+are not rotated: continuous sessions require monitoring available disk space.
+
 Inspect or export the valid prefix:
 
 ```bash

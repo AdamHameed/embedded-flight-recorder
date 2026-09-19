@@ -1,14 +1,45 @@
 #include "flight_recorder/flight_recorder.hpp"
 #include "flight_recorder/recovery_manager.hpp"
 
-#include <chrono>
+#include <algorithm>
+#include <atomic>
 #include <charconv>
+#include <chrono>
+#include <csignal>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace {
+
+// A process signal may be delivered to any recorder thread. Only lock-free
+// atomic operations are used in the handler; all I/O stays on the main thread.
+static_assert(std::atomic<int>::is_always_lock_free);
+std::atomic<int> shutdown_signal {0};
+
+void request_shutdown(int signal) {
+    shutdown_signal.store(signal, std::memory_order_relaxed);
+}
+
+std::uint32_t parse_unsigned(const std::string& value) {
+    std::uint32_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc {} || result.ptr != value.data() + value.size()) {
+        throw std::invalid_argument("expected an unsigned 32-bit integer");
+    }
+    return parsed;
+}
+
+void print_stats(const flight_recorder::RecorderStats& stats) {
+    std::cout << "generated=" << stats.total_records_generated
+              << " written=" << stats.total_records_written
+              << " committed=" << stats.total_records_committed
+              << " dropped=" << stats.dropped_records
+              << " buffer_high_watermark=" << stats.buffer_high_watermark
+              << " writer_error=" << (stats.writer_error ? "true" : "false")
+              << std::endl;
+}
 
 flight_recorder::RuntimeFaultMode parse_fault_mode(const std::string& value) {
     if (value == "none") {
@@ -52,7 +83,8 @@ flight_recorder::RuntimeFaultMode parse_fault_mode(const std::string& value) {
 
 void print_usage() {
     std::cout
-        << "Usage: flight_recorder [--output path] [--duration-seconds N] "
+        << "Usage: flight_recorder [--output path] [--duration-seconds N | --run-until-signal] "
+        << "[--stats-interval-ms N] "
         << "[--sample-rate-hz N] [--buffer-size N] "
         << "[--batch-size N] [--sync-every-batches N] [--flush-interval-ms N] "
         << "[--seed N] "
@@ -63,9 +95,11 @@ void print_usage() {
            "crash-after-journal|drop-commit] "
         << "[--fault-sequence N]\n"
         << "Flush interval: milliseconds before committing a pending group; 0 disables the timer.\n"
+        << "SIGINT/SIGTERM stop acquisition, drain the queue, and commit pending records.\n"
+        << "Stats interval: periodic live counters; 0 disables reporting (default).\n"
         << "Counters: generated=sensor samples; written=complete main-log records; "
            "committed=records covered by a durably acknowledged checkpoint; "
-           "dropped=records evicted from the full bounded ring.\n";
+           "dropped=samples rejected when the bounded ring stays full.\n";
 }
 
 }  // namespace
@@ -73,6 +107,9 @@ void print_usage() {
 int main(int argc, char** argv) {
     flight_recorder::RecorderConfig config;
     int duration_seconds = 5;
+    bool duration_set = false;
+    bool run_until_signal = false;
+    std::uint32_t stats_interval_ms = 0;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -80,7 +117,17 @@ int main(int argc, char** argv) {
             if (arg == "--output" && i + 1 < argc) {
                 config.output_path = argv[++i];
             } else if (arg == "--duration-seconds" && i + 1 < argc) {
-                duration_seconds = std::stoi(argv[++i]);
+                const std::string value = argv[++i];
+                const auto result = std::from_chars(
+                    value.data(), value.data() + value.size(), duration_seconds);
+                if (result.ec != std::errc {} || result.ptr != value.data() + value.size()) {
+                    throw std::invalid_argument("duration must be an integer");
+                }
+                duration_set = true;
+            } else if (arg == "--run-until-signal") {
+                run_until_signal = true;
+            } else if (arg == "--stats-interval-ms" && i + 1 < argc) {
+                stats_interval_ms = parse_unsigned(argv[++i]);
             } else if (arg == "--sample-rate-hz" && i + 1 < argc) {
                 config.sample_rate_hz = static_cast<unsigned int>(std::stoul(argv[++i]));
             } else if (arg == "--buffer-size" && i + 1 < argc) {
@@ -90,12 +137,7 @@ int main(int argc, char** argv) {
             } else if (arg == "--sync-every-batches" && i + 1 < argc) {
                 config.sync_every_batches = static_cast<std::size_t>(std::stoull(argv[++i]));
             } else if (arg == "--flush-interval-ms" && i + 1 < argc) {
-                const std::string value = argv[++i];
-                const auto result = std::from_chars(
-                    value.data(), value.data() + value.size(), config.flush_interval_ms);
-                if (result.ec != std::errc {} || result.ptr != value.data() + value.size()) {
-                    throw std::invalid_argument("flush interval must be an unsigned 32-bit integer");
-                }
+                config.flush_interval_ms = parse_unsigned(argv[++i]);
             } else if (arg == "--seed" && i + 1 < argc) {
                 config.simulator_seed = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             } else if (arg == "--unpaced") {
@@ -119,6 +161,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (duration_set && run_until_signal) {
+        std::cerr << "--duration-seconds and --run-until-signal are mutually exclusive\n";
+        return 1;
+    }
     if (duration_seconds < 0) {
         std::cerr << "duration must not be negative\n";
         return 1;
@@ -127,6 +173,15 @@ int main(int argc, char** argv) {
     if (config.sample_rate_hz == 0 || config.buffer_size == 0 || config.batch_size == 0 ||
         config.sync_every_batches == 0) {
         std::cerr << "sample rate, buffer size, batch size, and sync group must be greater than zero\n";
+        return 1;
+    }
+
+    struct sigaction action {};
+    action.sa_handler = request_shutdown;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, nullptr) != 0 ||
+        sigaction(SIGTERM, &action, nullptr) != 0) {
+        std::cerr << "failed to install shutdown signal handlers\n";
         return 1;
     }
 
@@ -152,22 +207,41 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "Recording to " << config.output_path << " for "
-              << duration_seconds << " seconds"
+    std::cout << "Recording to " << config.output_path
+              << (run_until_signal ? " until SIGINT/SIGTERM" :
+                  " for " + std::to_string(duration_seconds) + " seconds")
               << " seed=" << config.simulator_seed
-              << '\n';
-    std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+              << std::endl;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = run_until_signal ? Clock::time_point::max() :
+        Clock::now() + std::chrono::seconds(duration_seconds);
+    const auto stats_interval = std::chrono::milliseconds(stats_interval_ms);
+    auto next_stats = stats_interval_ms == 0 ? Clock::time_point::max() :
+        Clock::now() + stats_interval;
+    while (shutdown_signal.load(std::memory_order_relaxed) == 0 && Clock::now() < deadline) {
+        const auto stats = recorder.stats();
+        if (stats.writer_error) {
+            break;
+        }
+        const auto now = Clock::now();
+        if (now >= next_stats) {
+            std::cout << "status ";
+            print_stats(stats);
+            next_stats = now + stats_interval;
+        }
+        std::this_thread::sleep_until(std::min({deadline, next_stats,
+                                             now + std::chrono::milliseconds(20)}));
+    }
     recorder.stop();
+
+    const int received_signal = shutdown_signal.load(std::memory_order_relaxed);
+    if (received_signal != 0) {
+        std::cout << "shutdown_signal=" << received_signal << '\n';
+    }
 
     const auto stats = recorder.stats();
     std::cout << "Recording complete\n";
-    std::cout << "generated=" << stats.total_records_generated
-              << " written=" << stats.total_records_written
-              << " committed=" << stats.total_records_committed
-              << " dropped=" << stats.dropped_records
-              << " buffer_high_watermark=" << stats.buffer_high_watermark
-              << " writer_error=" << (stats.writer_error ? "true" : "false")
-              << '\n';
+    print_stats(stats);
 
     const auto recovery_report = recovery_manager.validate(config.output_path);
     std::cout << "replay_validation healthy=" << (recovery_report.healthy ? "true" : "false")
